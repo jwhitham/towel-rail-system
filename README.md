@@ -64,9 +64,9 @@ The device has the following features:
 
 # Hardware design
 
-The circuit diagram:
+The circuit diagram ([kicad files](vs)):
 
-![Hand-drawn circuit diagram](img/circuit_diagram.jpg)
+![Circuit diagram](vs/vs.svg)
 
 I put most of the hardware onto a single piece of stripboard with 2.54mm spacing
 to match the Pico pins. The Pico plugs into a PCB socket which allows it to be removed
