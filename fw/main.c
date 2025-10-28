@@ -127,7 +127,7 @@ static void make_report(control_status_t* cs, char* message, size_t size) {
     const float internal_temperature_value = temperature_internal(cs->temperature_handle);
 
     snprintf(message, size,
-        "ext %1.1f int %1.1f control %s auto %u temp %s up %u\n",
+        "ext %1.2f int %1.2f control %s auto %u temp %s up %u\n",
         (double) cs->external_temperature_value,
         (double) internal_temperature_value,
         control_text,
