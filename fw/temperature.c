@@ -4,10 +4,12 @@
  * 
  * SPDX-License-Identifier: BSD-3-Clause
  * 
- * ventilation-system temperature ADC driver
+ * towel-rail-system temperature ADC driver
  *
- * This component reads the temperature using the ADC, applies filtering
+ * This component reads the temperature using the ADCs, applies filtering
  * to reduce noise, and returns values in degrees Celsius.
+ *
+ * External thermistors are Vishay 640-15K types, see NTCLE100E3.pdf
  * 
  */
 
@@ -23,8 +25,8 @@
 
 #define ADC_FULL_SCALE      (1 << 12)
 #define HISTORY_SIZE        100     // Temperatures averaged over 100 samples
-#define ADC_REF_VOLTAGE     3.3f
-#define MAX_REPORT_SIZE     2000
+#define ADC_REF_VOLTAGE     2.506f  // Using a TL431A reference
+#define FIXED_RESISTANCE    15000.0f
 
 typedef struct sensor_history_t {
     int         index;
@@ -33,11 +35,10 @@ typedef struct sensor_history_t {
 } sensor_history_t;
 
 typedef struct temperature_t {
+    sensor_history_t    bathroom_sensor_history;
+    sensor_history_t    bedroom_sensor_history;
     sensor_history_t    internal_sensor_history;
-    sensor_history_t    external_sensor_history;
-    int16_t             report_data[MAX_REPORT_SIZE];
-    uint32_t            report_index;
-    float               external_lookup_table[ADC_FULL_SCALE];
+    float               vishay_lookup_table[ADC_FULL_SCALE];
     float               internal_lookup_table[ADC_FULL_SCALE];
 } temperature_t;
 
@@ -53,39 +54,38 @@ static void update_history(sensor_history_t* sh, int16_t new_value) {
 }
 
 void temperature_update(struct temperature_t* t) {
-    adc_select_input(4);
+    adc_select_input(ADC_BATHROOM);
+    update_history(&t->bathroom_sensor_history, adc_read());
+    adc_select_input(ADC_BEDROOM);
+    update_history(&t->bedroom_sensor_history, adc_read());
+    adc_select_input(ADC_INT_TEMP);
     update_history(&t->internal_sensor_history, adc_read());
-    adc_select_input(2);
-    const int16_t a = adc_read();
-    update_history(&t->external_sensor_history, a);
-    if (t->report_index >= MAX_REPORT_SIZE) {
-        t->report_index = 0;
-    }
-    t->report_data[t->report_index] = a;
-    t->report_index++;
+}
+
+static float vishay_temperature_calc(const float fraction) {
+    // determine resistance
+    const float thermistor_resistance = FIXED_RESISTANCE / ((1.0 / fraction) - 1.0);
+    const float A1 = 3.354016e-3f;
+    const float B1 = 2.744032e-4f;
+    const float C1 = 3.666944e-6f;
+    const float D1 = 1.375492e-7f;
+    const float CtoK = 273.15f;
+    const float ratio = logf(thermistor_resistance / FIXED_RESISTANCE);
+    return (1.0f / (A1 + (B1 * ratio) + (C1 * powf(ratio, 2.0f)) + (D1 * powf(ratio, 3.0f)))) - CtoK;
 }
 
 static float internal_temperature_calc(const float fraction) {
-    // calculate voltage from sample value
     const float voltage = ADC_REF_VOLTAGE * fraction;
-    // Apply the equation from the RP-2350 data sheet (section 12.4.6, "Temperature Sensor")
+    // Apply the equation from the RP2040 data sheet (section 4.9.5, "Temperature Sensor")
     // Return value in Celsius
     return 27.0f - ((voltage - 0.706f) / 0.001721f);
 }
 
-static float external_temperature_calc(const float fraction) {
-    // sample value in 0.0 .. 1.0 range
-    const float CtoK = 273.15f;  // return value will be in Celsius
-    // calculate resistance of thermistor (there is a voltage divider with a fixed 15k resistance)
-    const float r2 = 15000.0f;
-    const float r1 = r2 / ((1.0f / fraction) - 1.0f);
-    // Apply a simplified version of the Steinhart-Hart equation with C = 0
-    // The thermistor type is not known and I have no official data on it, but I got the approximate B value experimentally
-    const float A = 1.0f / (CtoK + 25.0f);
-    const float B = 0.000305267f;
-    const float Rref = 15.0e3f;
-    const float ratio = logf(r1 / Rref);
-    return (1.0f / (A + (B * ratio))) - CtoK;
+static void pin_init(int pin) {
+    gpio_set_dir(pin, GPIO_IN);
+    gpio_set_function(pin, GPIO_FUNC_SIO);
+    gpio_disable_pulls(pin);
+    gpio_set_input_enabled(pin, false);
 }
 
 struct temperature_t* temperature_init() {
@@ -96,17 +96,15 @@ struct temperature_t* temperature_init() {
 
     adc_init();
     adc_set_temp_sensor_enabled(true);
-
-    gpio_set_dir(ADC_PIN, GPIO_IN);
-    gpio_set_function(ADC_PIN, GPIO_FUNC_SIO);
-    gpio_disable_pulls(ADC_PIN);
-    gpio_set_input_enabled(ADC_PIN, false);
-
+    pin_init(ADC_BEDROOM_PIN);
+    pin_init(ADC_BATHROOM_PIN);
+    pin_init(ADC_UNUSED_PIN);
+    
     // compute lookup table: values at 0 and ADC_FULL_SCALE - 1 are not filled
     // as these represent fraction 0.0 and 1.0
     for (int i = 1; i < (ADC_FULL_SCALE - 1); i++) {
         float fraction = ((float) i) / (float) (ADC_FULL_SCALE - 1);
-        t->external_lookup_table[i] = external_temperature_calc(fraction);
+        t->vishay_lookup_table[i] = vishay_temperature_calc(fraction);
         t->internal_lookup_table[i] = internal_temperature_calc(fraction);
     }
 
@@ -115,16 +113,6 @@ struct temperature_t* temperature_init() {
         temperature_update(t);
     }
     return t;
-}
-
-uint32_t temperature_copy(struct temperature_t* t, void* payload, uint32_t max_size) {
-    uint32_t size = t->report_index * 2;
-    if (size > max_size) {
-        size = max_size;
-    }
-    memcpy(payload, t->report_data, size);
-    t->report_index = 0;
-    return size;
 }
 
 static float temperature_lookup(const float* lookup_table, const struct sensor_history_t* history) {
@@ -144,8 +132,12 @@ static float temperature_lookup(const float* lookup_table, const struct sensor_h
     return ((fractional_index - (float) integer_index) * (above_value - below_value)) + below_value;
 }
 
-float temperature_external(const struct temperature_t* t) {
-    return temperature_lookup(t->external_lookup_table, &t->external_sensor_history);
+float temperature_bedroom(const struct temperature_t* t) {
+    return temperature_lookup(t->vishay_lookup_table, &t->bedroom_sensor_history);
+}
+
+float temperature_bathroom(const struct temperature_t* t) {
+    return temperature_lookup(t->vishay_lookup_table, &t->bathroom_sensor_history);
 }
 
 float temperature_internal(const struct temperature_t* t) {

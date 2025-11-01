@@ -4,7 +4,7 @@
  * 
  * SPDX-License-Identifier: BSD-3-Clause
  * 
- * ventilation-system mbedtls_config.h
+ * towel-rail-system mbedtls_config.h
  *
  * This file configures the mbedtls library (crypto functions
  * used by wifi_settings).

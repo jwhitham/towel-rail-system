@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 #
-# ventilation-system toplevel CMakeLists.txt
+# towel-rail-system toplevel CMakeLists.txt
 #
 # This is a sample project for the wifi_settings library at
 # https://github.com/jwhitham/pico-wifi-settings
@@ -13,7 +13,7 @@ cmake_minimum_required(VERSION 3.12)
 # Pull in SDK (must be before project)
 include(pico_sdk_import.cmake)
 
-project(ventilation_system C CXX ASM)
+project(towel_rail_system C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 

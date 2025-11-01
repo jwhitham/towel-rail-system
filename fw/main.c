@@ -4,7 +4,7 @@
  * 
  * SPDX-License-Identifier: BSD-3-Clause
  * 
- * ventilation-system main
+ * towel-rail-system main
  *
  * See README.md: this is a sample project for the wifi_settings library at
  * https://github.com/jwhitham/pico-wifi-settings
@@ -18,6 +18,7 @@
 #include "pico/bootrom.h"
 #include "pico/cyw43_driver.h"
 #include "pico/multicore.h"
+#include "pico/cyw43_arch.h"
 
 #include "wifi_settings.h"
 
@@ -27,7 +28,6 @@
 
 #include "lwip/udp.h"
 
-#include "leds.h"
 #include "temperature.h"
 #include "settings.h"
 
@@ -37,39 +37,32 @@
 
 #define MAX_REPORT_SIZE     100
 #define ID_GET_STATUS_HANDLER (ID_FIRST_USER_HANDLER + 0)
-#define ID_SET_RELAYS_HANDLER (ID_FIRST_USER_HANDLER + 1)
 
 
 typedef enum {
-    TEMP_COLD = 0,      // Close to freezing
+    TEMP_COLD = 0,      // Cold
     TEMP_MILD,          // Normal
-    TEMP_HOT,           // Too hot
+    TEMP_HOT,           // Too hot in the house already
+    TEMP_ERROR,         // Controller temperature is too high or low
 } temperature_t;
 
 typedef enum {
-    MODE_AUTO = 0,      // Automatic
-    MODE_AUTO_DARK,     // Automatic, evening, increase power after dark
-    MODE_MANUAL_OFF,    // manually set to off
-    MODE_MANUAL_ON,     // manually set to on
-    MODE_MANUAL_BOOST,  // manually set to boost
-} manual_mode_t;
-
-typedef enum {
-    CONTROL_OFF = 0,    // off
-    CONTROL_ON,         // on
-    CONTROL_BOOST,      // boost
-} control_mode_t;
+    MODE_OFF = 0,
+    MODE_ON_WHEN_COLD,
+    MODE_ON_WHEN_MILD,
+    MODE_ON_WHEN_HOT,
+    MODE_ON_BOOST,
+} on_mode_t;
 
 typedef struct config_t {
     float                       cold_threshold;     // largest numerical value
     float                       not_cold_threshold;
     float                       not_hot_threshold;
     float                       hot_threshold;      // smallest numerical value
-    int                         change_delay_s;
     ip_addr_t                   report_addr;
     int                         report_port;
     int                         report_interval_s;
-    int                         manual_timeout_s;
+    int                         max_on_time_m;
     int                         control_port;
 } config_t;
 
@@ -77,35 +70,31 @@ typedef struct control_status_t {
     config_t                    config;
     int                         heartbeat_counter;
     temperature_t               temperature_band;
-    manual_mode_t               manual_mode;
-    control_mode_t              next_control_mode;
-    control_mode_t              current_control_mode;
-    absolute_time_t             control_mode_update_time;
+    on_mode_t                   on_mode;
+    bool                        output_value;
+    bool                        last_output_value;
     absolute_time_t             report_update_time;
-    absolute_time_t             manual_mode_end_time;
-    float                       external_temperature_value;
+    absolute_time_t             on_mode_end_time;
+    float                       bathroom_temperature_value;
+    float                       internal_temperature_value;
     struct temperature_t*       temperature_handle;
     struct udp_pcb*             comms_pcb;
 } control_status_t;
 
-static bool is_manual_mode(manual_mode_t mode) {
-    switch (mode) {
-        case MODE_AUTO:
-        case MODE_AUTO_DARK:
-            return false;
-        default:
-            return true;
-    }
-}
-
 static void make_report(control_status_t* cs, char* message, size_t size) {
-    const char* control_text = "OFF";
-    switch (cs->current_control_mode) {
-        case CONTROL_ON:
-            control_text = "ON";
+    const char* mode_text = "OFF";
+    switch (cs->on_mode) {
+        case MODE_ON_WHEN_HOT:
+            mode_text = "ON_WHEN_HOT";
             break;
-        case CONTROL_BOOST:
-            control_text = "BOOST";
+        case MODE_ON_BOOST:
+            mode_text = "ON_BOOST";
+            break;
+        case MODE_ON_WHEN_MILD:
+            mode_text = "ON_WHEN_MILD";
+            break;
+        case MODE_ON_WHEN_COLD:
+            mode_text = "ON_WHEN_COLD";
             break;
         default:
             break;
@@ -119,20 +108,26 @@ static void make_report(control_status_t* cs, char* message, size_t size) {
         case TEMP_HOT:
             temp_text = "HOT";
             break;
+        case TEMP_ERROR:
+            temp_text = "ERROR";
+            break;
         default:
             break;
     }
 
-    const uint64_t uptime = to_us_since_boot(get_absolute_time()) / 1000000ULL;
-    const float internal_temperature_value = temperature_internal(cs->temperature_handle);
+    const uint64_t now = to_us_since_boot(get_absolute_time());
+    const uint64_t uptime = now / 1000000ULL;
+    const int64_t on_time_left = 1LL + (((int64_t) to_us_since_boot(cs->on_mode_end_time) - (int64_t) now) / (60LL * 1000000LL));
 
     snprintf(message, size,
-        "ext %1.2f int %1.2f control %s auto %u temp %s up %u\n",
-        (double) cs->external_temperature_value,
-        (double) internal_temperature_value,
-        control_text,
-        is_manual_mode(cs->manual_mode) ? 0 : 1,
+        "bath %1.2f bed %1.2f int %1.2f mode %s out %s temp %s left %u up %u\n",
+        (double) cs->bathroom_temperature_value,
+        (double) temperature_bedroom(cs->temperature_handle),
+        (double) cs->internal_temperature_value,
+        mode_text,
+        cs->output_value ? "TRUE" : "FALSE",
         temp_text,
+        (on_time_left > 0LL) ? (unsigned) on_time_left : 0U,
         (unsigned) uptime);
 }
 
@@ -159,139 +154,93 @@ static void make_report_and_send_by_udp(control_status_t* cs) {
 static void periodic_task(control_status_t* cs) {
     // Read temperature sensors
     temperature_update(cs->temperature_handle);
-    cs->external_temperature_value = temperature_external(cs->temperature_handle);
+
+    // Check internal temperature
+    cs->internal_temperature_value = temperature_internal(cs->temperature_handle);
+    bool internal_out_of_range = ((cs->internal_temperature_value < MIN_INTERNAL_TEMP)
+                || (cs->internal_temperature_value > MAX_INTERNAL_TEMP));
 
     // Determine temperature range
+    cs->bathroom_temperature_value = temperature_bathroom(cs->temperature_handle);
+    bool state_changed = false;
     switch (cs->temperature_band) {
         case TEMP_COLD:
-            if (cs->external_temperature_value > cs->config.not_cold_threshold) {
+            if (cs->bathroom_temperature_value > cs->config.not_cold_threshold) {
                 cs->temperature_band = TEMP_MILD;
+                state_changed = true;
             }
             break;
         case TEMP_HOT:
-            if (cs->external_temperature_value < cs->config.not_hot_threshold) {
+            if (cs->bathroom_temperature_value < cs->config.not_hot_threshold) {
                 cs->temperature_band = TEMP_MILD;
+                state_changed = true;
             }
             break;
         case TEMP_MILD:
-            if (cs->external_temperature_value > cs->config.hot_threshold) {
+            if (cs->bathroom_temperature_value > cs->config.hot_threshold) {
                 cs->temperature_band = TEMP_HOT;
-            }
-            if (cs->external_temperature_value < cs->config.cold_threshold) {
+                state_changed = true;
+            } else if (cs->bathroom_temperature_value < cs->config.cold_threshold) {
                 cs->temperature_band = TEMP_COLD;
+                state_changed = true;
             }
             break;
         default:
-            cs->temperature_band = TEMP_MILD;
-            break;
-    }
-
-    // Leave manual mode if the timeout is reached
-    if (is_manual_mode(cs->manual_mode)
-    && time_reached(cs->manual_mode_end_time)) {
-        cs->manual_mode = MODE_AUTO;
-    }
-
-    // Decide which control mode to be in
-    switch (cs->manual_mode) {
-        case MODE_AUTO:
-            if (cs->temperature_band == TEMP_MILD) {
-                cs->next_control_mode = CONTROL_ON;
+            // stay in error state while out of range
+            if (internal_out_of_range) {
+                cs->temperature_band = TEMP_ERROR;
             } else {
-                cs->next_control_mode = CONTROL_OFF;
+                cs->temperature_band = TEMP_HOT;
+                state_changed = true;
             }
             break;
-        case MODE_AUTO_DARK:
-            if (cs->temperature_band == TEMP_MILD) {
-                cs->next_control_mode = CONTROL_BOOST;
-            } else {
-                cs->next_control_mode = CONTROL_OFF;
-            }
-            break;
-        case MODE_MANUAL_OFF:
-            cs->next_control_mode = CONTROL_OFF;
-            break;
-        case MODE_MANUAL_ON:
-            cs->next_control_mode = CONTROL_ON;
-            break;
-        case MODE_MANUAL_BOOST:
-            cs->next_control_mode = CONTROL_BOOST;
-            break;
-        default:
-            cs->next_control_mode = CONTROL_OFF;
-            break;
     }
 
-    // Change control mode if the update time is reached
-    bool output_changed = false;
-    if ((cs->next_control_mode != cs->current_control_mode)
-    && time_reached(cs->control_mode_update_time)) {
-        cs->current_control_mode = cs->next_control_mode;
-        switch (cs->current_control_mode) {
-            case CONTROL_ON:
-                gpio_put(BOOST_RELAY_GPIO, 0);
-                gpio_put(MAINS_RELAY_GPIO, 1);
-                break;
-            case CONTROL_BOOST:
-                gpio_put(BOOST_RELAY_GPIO, 1);
-                gpio_put(MAINS_RELAY_GPIO, 1);
-                break;
-            default:
-                gpio_put(BOOST_RELAY_GPIO, 0);
-                gpio_put(MAINS_RELAY_GPIO, 0);
-                break;
+    // Turn off if the timeout is reached
+    if (time_reached(cs->on_mode_end_time) && (cs->on_mode != MODE_OFF)) {
+        cs->on_mode = MODE_OFF;
+        state_changed = true;
+    }
+
+    // React to internal out of range condition by turning off
+    if (internal_out_of_range) {
+        if (cs->temperature_band != TEMP_ERROR) {
+            state_changed = true;
         }
-        cs->control_mode_update_time = make_timeout_time_ms(cs->config.change_delay_s * 1000);
-        output_changed = true;
+        cs->temperature_band = TEMP_ERROR;
+        cs->on_mode_end_time = nil_time;
+        cs->on_mode = MODE_OFF;
     }
 
-    // Show the current state on the LEDs
-    uint leds = POWER_LED_BIT; // power always on
+    // Determine output
+    switch (cs->on_mode) {
+        case MODE_ON_WHEN_COLD:
+            cs->output_value = (cs->temperature_band == TEMP_COLD);
+            break;
+        case MODE_ON_WHEN_MILD:
+            cs->output_value = (cs->temperature_band == TEMP_COLD)
+                            || (cs->temperature_band == TEMP_MILD);
+            break;
+        case MODE_ON_WHEN_HOT:
+        case MODE_ON_BOOST:
+            cs->output_value = (cs->temperature_band == TEMP_COLD)
+                            || (cs->temperature_band == TEMP_MILD)
+                            || (cs->temperature_band == TEMP_HOT);
+            break;
+        default:
+            cs->output_value = false;
+            break;
+    }
+
+    // Set output
+    if (cs->output_value != cs->last_output_value) {
+        cs->last_output_value = cs->output_value;
+        gpio_put(SSR_GPIO, (int) cs->output_value);
+        state_changed = true;
+    }
 
     // Heartbeat LED
-    leds |= (cs->heartbeat_counter == 0) ? HEARTBEAT_LED_BIT : 0;
-
-    // Relay LEDs (red)
-    switch (cs->current_control_mode) {
-        case CONTROL_ON:
-            leds |= MAINS_RELAY_LED_BIT;
-            break;
-        case CONTROL_BOOST:
-            leds |= BOOST_RELAY_LED_BIT;
-            leds |= MAINS_RELAY_LED_BIT;
-            break;
-        default:
-            break;
-    }
-
-    // Temperature input LEDs (yellow)
-    // Steady in auto mode, flashing in manual mode
-    if (!is_manual_mode(cs->manual_mode)) {
-        switch (cs->temperature_band) {
-            case TEMP_COLD:
-                leds |= COLD_LED_BIT;
-                break;
-            case TEMP_HOT:
-                leds |= HOT_LED_BIT;
-                break;
-            default:
-                break;
-        }
-    } else {
-        switch (cs->heartbeat_counter) {
-            case 1:
-                leds |= HOT_LED_BIT;
-                break;
-            case 2:
-                leds |= COLD_LED_BIT;
-                break;
-            default:
-                break;
-        }
-    }
-
-    // LED output
-    leds_output_set(leds);
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, (cs->heartbeat_counter == 0) ? 1 : 0);
 
     // Heartbeat update: faster when WiFi is not working
     if ((cs->heartbeat_counter > 0) && !wifi_settings_is_connected()) {
@@ -303,8 +252,11 @@ static void periodic_task(control_status_t* cs) {
     }
 
     // UDP report: send periodic update
-    if (time_reached(cs->report_update_time) || output_changed) {
+    if (time_reached(cs->report_update_time)) {
+        state_changed = true;
         cs->report_update_time = delayed_by_ms(cs->report_update_time, cs->config.report_interval_s * 1000);
+    }
+    if (state_changed) {
         make_report_and_send_by_udp(cs);
     }
 }
@@ -318,7 +270,6 @@ static int32_t remote_handler_get_status(
         void* arg) {
 
     control_status_t* cs = (control_status_t *) arg;
-    uint32_t flags = save_and_disable_interrupts();
     switch (input_parameter) {
         case 0:
             // Text report
@@ -332,64 +283,60 @@ static int32_t remote_handler_get_status(
             }
             memcpy(data_buffer, cs, (size_t) *output_data_size);
             break;
-        case 2:
-            // Temperature report dump
-            *output_data_size = temperature_copy(cs->temperature_handle, data_buffer, *output_data_size);
-            break;
         default:
             *output_data_size = 0;
             break;
     }
-    restore_interrupts(flags);
     return 0;
 }
 
-static bool manual_setting(control_status_t* cs, const char* command, size_t size) {
-    uint32_t flags = save_and_disable_interrupts();
-    bool ok = false;
-    if (strncmp(command, "piv auto", size) == 0) {
-        cs->manual_mode = MODE_AUTO;
-        ok = true;
-    } else if (strncmp(command, "piv dark", size) == 0) {
-        cs->manual_mode = MODE_AUTO_DARK;
-        ok = true;
-    } else if (strncmp(command, "piv on", size) == 0) {
-        cs->manual_mode = MODE_MANUAL_ON;
-        ok = true;
-    } else if (strncmp(command, "piv boost", size) == 0) {
-        cs->manual_mode = MODE_MANUAL_BOOST;
-        ok = true;
-    } else if (strncmp(command, "piv off", size) == 0) {
-        cs->manual_mode = MODE_MANUAL_OFF;
-        ok = true;
+static bool mode_setting(control_status_t* cs, const char* recv_buffer, size_t recv_size) {
+    char copy_buffer[40];
+    if (recv_size >= sizeof(copy_buffer)) {
+        recv_size = sizeof(copy_buffer) - 1;
     }
-    if (ok) {
-        cs->manual_mode_end_time = make_timeout_time_ms(cs->config.manual_timeout_s * 1000);
-        make_report_and_send_by_udp(cs);
+    memcpy(copy_buffer, recv_buffer, recv_size);
+    copy_buffer[recv_size] = '\0';
+    char command[sizeof(copy_buffer)] = {0};
+    int minutes = -1;
+    if (2 != sscanf(copy_buffer, "%s %d", command, &minutes)) {
+        return false;
     }
-    restore_interrupts(flags);
-    return ok;
-}
-
-static int32_t remote_handler_set_relays(
-        uint8_t msg_type,
-        uint8_t* data_buffer,
-        uint32_t input_data_size,
-        int32_t input_parameter,
-        uint32_t* output_data_size,
-        void* arg) {
-    control_status_t* cs = (control_status_t *) arg;
-    *output_data_size = 0;
-    if (!manual_setting(cs, (const char *) data_buffer, (size_t) input_data_size)) {
-        return 1;
+    if ((minutes < 0) || (minutes > cs->config.max_on_time_m)) {
+        return false;
     }
-    return 0;
+    if (strcasecmp(command, "ON_BOOST") == 0) {
+        cs->on_mode = MODE_ON_BOOST;
+    } else if (strcasecmp(command, "OFF") == 0) {
+        cs->on_mode = MODE_OFF;
+    } else if (cs->on_mode == MODE_ON_BOOST) {
+        // ignore all other commands
+        return false;
+    } else if (strcasecmp(command, "ON_WHEN_COLD") == 0) {
+        cs->on_mode = MODE_ON_WHEN_COLD;
+    } else if (strcasecmp(command, "ON_WHEN_MILD") == 0) {
+        cs->on_mode = MODE_ON_WHEN_MILD;
+    } else if (strcasecmp(command, "ON_WHEN_HOT") == 0) {
+        cs->on_mode = MODE_ON_WHEN_HOT;
+    } else {
+        // unknown command
+        return false;
+    }
+    // update the turn-off time
+    if (cs->on_mode != MODE_OFF) {
+        cs->on_mode_end_time = make_timeout_time_ms(minutes * 60 * 1000);
+    } else {
+        cs->on_mode_end_time = nil_time;
+    }
+    // send report at the next periodic update
+    cs->report_update_time = get_absolute_time();
+    return true;
 }
 
 static void comms_recv_callback(void *arg, struct udp_pcb *pcb,
         struct pbuf *p, const ip_addr_t *addr, u16_t port) {
     control_status_t* cs = (control_status_t *) arg;
-    (void) manual_setting(cs, (const char*) p->payload, (size_t) p->len);
+    (void) mode_setting(cs, (const char*) p->payload, (size_t) p->len);
     pbuf_free(p);
 }
 
@@ -430,13 +377,10 @@ static int config_get_int(const char* key, int min_value, int default_value, int
 
 static void config_init(control_status_t* cs) {
     // min/max values for ADC readings
-    cs->config.cold_threshold = config_get_float("cold_threshold", 0.0f);
-    cs->config.not_cold_threshold = config_get_float("not_cold_threshold", 2.0f);
-    cs->config.not_hot_threshold = config_get_float("not_hot_threshold", 28.0f);
-    cs->config.hot_threshold = config_get_float("hot_threshold", 30.0f);
-
-    // minimum time between change of activity
-    cs->config.change_delay_s = config_get_int("change_delay_s", 1, 30, INT_MAX);
+    cs->config.cold_threshold = config_get_float("cold_threshold", 10.0f);
+    cs->config.not_cold_threshold = config_get_float("not_cold_threshold", 11.0f);
+    cs->config.not_hot_threshold = config_get_float("not_hot_threshold", 24.0f);
+    cs->config.hot_threshold = config_get_float("hot_threshold", 25.0f);
 
     // where to send messages
     char address[32];
@@ -453,17 +397,15 @@ static void config_init(control_status_t* cs) {
     // where to listen for commands
     cs->config.control_port = config_get_int("control_port", 0, 0, UINT16_MAX);
 
-    // timeout for manual settings
-    cs->config.manual_timeout_s = config_get_int("manual_timeout_s", 1, 60 * 60 * 24, INT_MAX);
+    // max time for any "on" command
+    cs->config.max_on_time_m = config_get_int("max_on_time_m", 1, 45, 180);
 }
 
 static void state_init(control_status_t* cs) {
     // initial setup
     memset(cs, 0, sizeof(control_status_t));
     cs->temperature_band = TEMP_MILD;
-    cs->manual_mode = MODE_AUTO;
-    cs->next_control_mode = CONTROL_OFF;
-    cs->current_control_mode = CONTROL_OFF;
+    cs->on_mode = MODE_OFF;
 
     // read config
     config_init(cs);
@@ -480,12 +422,10 @@ static void state_init(control_status_t* cs) {
         printf("unable to allocate temperature_handle\n");
         sleep_ms(1000);
     }
-    cs->external_temperature_value = temperature_external(cs->temperature_handle);
 
     // generate timeouts
-    cs->control_mode_update_time = make_timeout_time_ms(cs->config.change_delay_s * 1000);
+    cs->on_mode_end_time = nil_time;
     cs->report_update_time = make_timeout_time_ms(cs->config.report_interval_s * 1000);
-    cs->manual_mode_end_time = make_timeout_time_ms(cs->config.manual_timeout_s * 1000);
 }
 
 int main(void) {
@@ -494,17 +434,9 @@ int main(void) {
 
     stdio_init_all();
 
-    gpio_init(BOOST_RELAY_GPIO);
-    gpio_set_dir(BOOST_RELAY_GPIO, GPIO_OUT);
-    gpio_init(MAINS_RELAY_GPIO);
-    gpio_set_dir(MAINS_RELAY_GPIO, GPIO_OUT);
-
-    gpio_init(TEST_GPIO);
-    gpio_set_dir(TEST_GPIO, GPIO_IN);
-    gpio_pull_up(TEST_GPIO);
-
-    leds_output_init();
-    leds_output_set(~0);
+    gpio_init(SSR_GPIO);
+    gpio_set_dir(SSR_GPIO, GPIO_OUT);
+    gpio_set_drive_strength(SSR_GPIO, GPIO_DRIVE_STRENGTH_12MA);
 
     int rc = wifi_settings_init();
     while (rc != PICO_OK) {
@@ -520,15 +452,15 @@ int main(void) {
     }
     state_init(cs);
     wifi_settings_remote_set_handler(ID_GET_STATUS_HANDLER, remote_handler_get_status, cs);
-    wifi_settings_remote_set_handler(ID_SET_RELAYS_HANDLER, remote_handler_set_relays, cs);
     wifi_settings_connect();
 
     // main loop
-    absolute_time_t update_time = make_timeout_time_ms(0);
+    absolute_time_t update_time = get_absolute_time();
     while (true) {
-        uint32_t flags = save_and_disable_interrupts();
+        cyw43_arch_lwip_begin();
         periodic_task(cs);
-        restore_interrupts(flags);
+        cyw43_arch_lwip_end();
+
         sleep_until(update_time);
         update_time = delayed_by_ms(update_time, 100);
     }

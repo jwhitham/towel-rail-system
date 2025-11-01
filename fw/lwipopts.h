@@ -4,7 +4,7 @@
  * 
  * SPDX-License-Identifier: BSD-3-Clause
  * 
- * ventilation-system lwipopts.h (based on sample from pico-examples)
+ * towel-rail-system lwipopts.h (based on sample from pico-examples)
  * 
  * This file configures the LWIP library.
  */
