@@ -22,7 +22,7 @@ the controller is not in a very accessible place (behind a bookshelf).
 # Background
 
 An electric heated towel rail helps to dry towels
-and keep a bathroom warm, but it doesn't need to be switched on all 
+and keep a bathroom warm, but it doesn't need to be switched on all
 of the time. This controller integrates with my home automation
 system and allows the towel rail to be switched on for short periods
 when needed. It also reacts to the air temperature in the house, and
@@ -35,7 +35,7 @@ This project uses only one of the CPU cores, underclocks the CPU to 48MHz to sav
 energy, and uses a small fraction of the available memory.
 
 The Pico W is a low-cost device. It connects to WiFi, which provides the remote control
-features that I wanted, and it connects easily to electronics such as 
+features that I wanted, and it connects easily to electronics such as
 a solid state relay and thermistors, which allow it to control other devices and react to changes
 in the environment.
 
@@ -45,7 +45,7 @@ The device has the following features:
 - When activated by a UDP message, it activates the towel rail heater for a fixed time interval.
 - The activation is conditional on the bathroom temperature: the towel rail can be turned on more often if the bathroom is cold.
 
-# Software build and deploy 
+# Software build and deploy
 
 You'll need the [Pico SDK](https://github.com/raspberrypi/pico-sdk/) to build.
 
@@ -66,33 +66,38 @@ commands:
   internal status of the controller.
 
 # Hardware
+# Hardware design
+
+The circuit diagram ([kicad files](tr)):
+
+![Circuit diagram](tr/tr.svg)
 
 Experiences from the similar [ventilation-system
 controller project](https://github.com/jwhitham/ventilation-system)
 helped me to avoid some pitfalls. I used thermistors with known
 properties, avoiding the need to discover the "beta" value by experiment.
 
+Very few additional components are required. The most interesting is the
+[TL431A](https://www.ti.com/lit/ds/symlink/tl431.pdf) reference voltage device,
+without which, the Pico's internal temperature sensor is not accurate. It is
+configured to maintain ADC\_VREF at 2.5 volts (the most basic configuration). This
+is not required for the thermistors, since each is part of a voltage divider, and the
+ADC only measures the ratio between the fixed resistance (15k) and the thermistor.
+
 Mindful of the fact that the controller would be installed in a bedroom,
 on the other side of a bathroom wall, I avoided using a conventional
 mechanical relay for the control output, and instead used a (silent)
 [solid state relay module](https://www.fotek.com.tw/en-gb/product-category/143),
 which also cuts down on the components required,
-as it can be switched directly from a GPIO pin and does not require
-a 12V supply. A solid state relay for 240 volt a.c. contains a triac
-and opto-isolator, and in principle the relay can be built on a circuit
+as it can be switched directly from a GPIO pin at 3.3V. It does not require
+a 12V supply, a switching transistor or a diode for back emf.
+
+A solid state relay for 240 volt a.c. contains a triac
+and opto-isolator, and an equivalent can be built on a circuit
 board from discrete components,
 but I do not like building circuits involving mains electricity
 because of the serious problems that can occur if anything goes wrong
 and the extreme care that is required during construction. For mains,
 I prefer to use pre-built modules with safety certifications
-(e.g. CE mark). The 5V power supply for this project is another example
-of this.
-
-I expected noise from the ADCs as this was seen in the
-earlier project, but I know that averaging the data over 100
-samples is sufficient to avoid problems from this. I also added a
-[TL431A](https://www.ti.com/lit/ds/symlink/tl431.pdf) reference voltage device: this does not have an important
-effect on the accuracy of the external thermistor readings because these
-voltage dividers, but it does improve the accuracy of the Pico's
-internal temperature sensor, which is also monitored in order to shut down
-the system if it becomes too hot.
+(e.g. CE mark). The 5V power supply for this project is another example of this,
+specifically chosen because of its safety rating.
