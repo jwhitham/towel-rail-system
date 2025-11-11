@@ -115,9 +115,15 @@ static void make_report(control_status_t* cs, char* message, size_t size) {
             break;
     }
 
-    const uint64_t now = to_us_since_boot(get_absolute_time());
-    const uint64_t uptime = now / 1000000ULL;
-    const int64_t on_time_left = 1LL + (((int64_t) to_us_since_boot(cs->on_mode_end_time) - (int64_t) now) / (60LL * 1000000LL));
+    const int64_t second_us = 1000000LL;
+    const int64_t minute_us = 60LL * second_us;
+    // current monotonic time in microseconds
+    const int64_t now_us = (int64_t) to_us_since_boot(get_absolute_time());
+    // uptime: round down to a second
+    const int64_t uptime_s = now_us / second_us;
+    // on time left: round to nearest minute
+    const int64_t on_time_left_m =
+        (((int64_t) to_us_since_boot(cs->on_mode_end_time) - now_us) + (minute_us / 2LL)) / minute_us;
 
     snprintf(message, size,
         "bath %1.2f bed %1.2f int %1.2f mode %s out %s temp %s left %u up %u\n",
@@ -127,8 +133,8 @@ static void make_report(control_status_t* cs, char* message, size_t size) {
         mode_text,
         cs->output_value ? "TRUE" : "FALSE",
         temp_text,
-        (on_time_left > 0LL) ? (unsigned) on_time_left : 0U,
-        (unsigned) uptime);
+        (on_time_left_m > 0LL) ? (unsigned) on_time_left_m : 0U,
+        (unsigned) uptime_s);
 }
 
 static void make_report_and_send_by_udp(control_status_t* cs) {

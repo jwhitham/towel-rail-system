@@ -24,7 +24,7 @@
 #include "hardware/adc.h"
 
 #define ADC_FULL_SCALE      (1 << 12)
-#define HISTORY_SIZE        100     // Temperatures averaged over 100 samples
+#define HISTORY_SIZE        1000    // Temperatures averaged over 1000 samples
 #define ADC_REF_VOLTAGE     2.506f  // Using a TL431A reference
 #define FIXED_RESISTANCE    15000.0f
 
